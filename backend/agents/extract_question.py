@@ -13,12 +13,11 @@ from mcp.types import CallToolResult, TextContent
 
 ENV_PATH = Path(__file__).resolve().parents[1] / ".env"
 
+load_dotenv(ENV_PATH)
+
 BACKEND_DIR = ENV_PATH.parent
 LOCAL_MCP_COMMAND = BACKEND_DIR / ".venv" / "bin" / "minimax-coding-plan-mcp"
 MINIMAX_API_HOST = "https://api.minimaxi.com"
-
-load_dotenv(ENV_PATH)
-
 MINIMAX_API_KEY = os.getenv("MINIMAX_API_KEY")
 
 class ImagesUnderstandState(TypedDict):
@@ -83,7 +82,7 @@ def extract_exam_question_bbox(state: ImagesUnderstandState) -> dict:
         understand_images(state["user_uploaded_images_path"], prompt)
     )
 
-    print(combined_desc)
+    print("Combined Description:\n", combined_desc)
     return {"desc": combined_desc}
 
 def build_agent():
@@ -97,7 +96,6 @@ agent = build_agent()
 
 def main() -> None:
     final_state = agent.invoke({"user_uploaded_images_path": [Path(path) for path in sys.argv[1:]]})
-    print(final_state)
 
 if __name__ == "__main__":
     main()
