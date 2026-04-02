@@ -1,7 +1,5 @@
 import os
-import sys
-import time
-from typing import Any, TypedDict
+from typing import TypedDict
 
 from dotenv import load_dotenv
 from langchain_anthropic import ChatAnthropic
@@ -10,7 +8,7 @@ from langgraph.graph import END, START, StateGraph
 
 load_dotenv()
 
-MINIMAX_API_URL = os.getenv("MINIMAX_API_URL")
+MINIMAX_BASE_URL = os.getenv("MINIMAX_BASE_URL")
 MINIMAX_API_KEY = os.getenv("MINIMAX_API_KEY")
 MODEL_NAME = os.getenv("MINIMAX_MODEL", "MiniMax-M2.7")
 MAX_TOKENS = int(os.getenv("QUESTION_AGENT_MAX_TOKENS", "102400"))
@@ -23,7 +21,7 @@ class QuestionState(TypedDict):
 def create_llm() -> ChatAnthropic:
     client_kwargs = {
         "model": MODEL_NAME,
-        "base_url": MINIMAX_API_URL,
+        "base_url": MINIMAX_BASE_URL,
         "api_key": MINIMAX_API_KEY,
         "temperature": 1.0,
         "max_tokens": MAX_TOKENS,
@@ -32,17 +30,21 @@ def create_llm() -> ChatAnthropic:
 
     return ChatAnthropic(**client_kwargs)
 
-
-def answer_question(state: QuestionState) -> None:
+def answer_question(state: QuestionState) -> dict:
     llm = create_llm()
     response = llm.invoke([
         HumanMessage(content=state["question"])
     ])
-    print(response)
-    for message in response.content:
-        if message["type"] == "text":
-            state["answer"] += message["text"]
-            print(message["text"], end="\n", flush=True)
+
+    final_answer = ""
+    if isinstance(response.content, str):
+        final_answer = response.content
+    elif isinstance(response.content, list):
+        for block in response.content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                final_answer += block.get("text", "")
+
+    return {"answer": final_answer}
 
 def build_agent():
     graph = StateGraph(QuestionState)
@@ -56,10 +58,9 @@ agent = build_agent()
 
 
 def main() -> None:
-    state = QuestionState(question="你怎么评价Minimax?", answer="dummy answer")
-    agent.invoke(state)
+    initial_state = {"question": "你怎么评价Minimax?"}
+    final_state = agent.invoke(initial_state)
+    print(final_state["answer"])
 
 if __name__ == "__main__":
     main()
-
-
