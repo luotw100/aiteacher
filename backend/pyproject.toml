@@ -19,3 +19,33 @@ dependencies = [
 name = "tencent"
 url = "https://mirrors.cloud.tencent.com/pypi/simple"
 default = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+exclude = [
+    ".git",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".venv",
+    "__pycache__",
+]
+
+[tool.ruff.lint]
+select = [
+    "E",  # pycodestyle errors
+    "W",  # pycodestyle warnings
+    "F",  # pyflakes
+    "I",  # isort
+    "C",  # flake8-comprehensions
+    "B",  # flake8-bugbear
+]
+ignore = [
+    "E501",  # line too long (handled by formatter)
+]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
