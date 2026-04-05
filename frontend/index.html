@@ -12,18 +12,32 @@
         #fileInput { display: none; }
         .preview-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 15px; margin-bottom: 20px; }
         .preview-item { position: relative; }
-        .preview-item img { width: 100%; height: 200px; object-fit: contain; border: 1px solid #ddd; border-radius: 4px; }
+        .preview-item img { width: 100%; height: 200px; object-fit: contain; border: 1px solid #ddd; border-radius: 4px; cursor: pointer; transition: transform 0.2s; }
+        .preview-item img:hover { transform: scale(1.05); }
         .btn { background: #409eff; color: white; border: none; padding: 10px 20px; border-radius: 4px; cursor: pointer; font-size: 16px; margin-right: 10px; }
         .btn:disabled { background: #a0cfff; cursor: not-allowed; }
         #loading { display: none; color: #409eff; margin-top: 10px; }
         #resultArea { display: none; }
         .result-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 20px; margin-top: 20px; }
         .result-item { border: 1px solid #eee; padding: 10px; border-radius: 4px; text-align: center; }
-        .result-item img { max-width: 100%; border: 1px solid #ddd; }
+        .result-item img { max-width: 100%; border: 1px solid #ddd; cursor: pointer; transition: transform 0.2s; }
+        .result-item img:hover { transform: scale(1.05); }
         pre { background: #f8f8f8; padding: 15px; border-radius: 4px; overflow-x: auto; }
+        
+        /* 模态框样式 */
+        .modal { display: none; position: fixed; z-index: 1000; left: 0; top: 0; width: 100%; height: 100%; background-color: rgba(0,0,0,0.8); }
+        .modal-content { margin: auto; display: block; max-width: 90%; max-height: 90vh; position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); border-radius: 4px; box-shadow: 0 4px 12px rgba(0,0,0,0.3); }
+        .modal-close { position: absolute; top: 15px; right: 35px; color: #f1f1f1; font-size: 40px; font-weight: bold; cursor: pointer; }
+        .modal-close:hover, .modal-close:focus { color: #bbb; text-decoration: none; cursor: pointer; }
     </style>
 </head>
 <body>
+    <!-- 图片放大模态框 -->
+    <div id="imageModal" class="modal" onclick="closeModal()">
+        <span class="modal-close">&times;</span>
+        <img class="modal-content" id="expandedImg">
+    </div>
+
     <h1>AiTeacher - 试卷图像预处理体验</h1>
     
     <div class="card">
@@ -66,7 +80,7 @@
                     const div = document.createElement('div');
                     div.className = 'preview-item';
                     div.innerHTML = `
-                        <img src="${e.target.result}" alt="preview">
+                        <img src="${e.target.result}" alt="preview" onclick="openModal('${e.target.result}')">
                         <div style="text-align:center; font-size:12px; margin-top:5px;">Original Index: ${index}</div>
                     `;
                     grid.appendChild(div);
@@ -75,6 +89,18 @@
             });
             
             document.getElementById('submitBtn').disabled = selectedFiles.length === 0;
+        }
+
+        // 放大图片函数
+        function openModal(imgSrc) {
+            const modal = document.getElementById('imageModal');
+            const expandedImg = document.getElementById('expandedImg');
+            expandedImg.src = imgSrc;
+            modal.style.display = "block";
+        }
+
+        function closeModal() {
+            document.getElementById('imageModal').style.display = "none";
         }
 
         // 文件转 Base64 辅助函数
@@ -182,7 +208,7 @@
                 const div = document.createElement('div');
                 div.className = 'result-item';
                 div.innerHTML = `
-                    <img src="${b64}" alt="processed_image">
+                    <img src="${b64}" alt="processed_image" onclick="openModal('${b64}')">
                     <p>最终顺序：${i + 1}</p>
                 `;
                 grid.appendChild(div);
