@@ -3,6 +3,8 @@ import os
 import json
 import base64
 import mimetypes
+import io
+from PIL import Image
 from pathlib import Path
 from typing import TypedDict, Optional, Dict, List
 
@@ -23,12 +25,13 @@ ALIYUN_MODEL_NAME = os.getenv("ALIYUN_MODEL_NAME")
 class ImagesUnderstandState(TypedDict):
     user_uploaded_images_path: List[Path]
     correct_order_result: Dict
+    processed_images_base64: List[str]
     desc: str
 
 def encode_image_base64(image_path: Path) -> str:
     with open(image_path, "rb") as image_file:
         encoded_bytes = base64.b64encode(image_file.read()).decode("utf-8")
-        
+
     mime_type, _ = mimetypes.guess_type(image_path)
     if not mime_type or not mime_type.startswith("image/"):
         mime_type = "image/jpeg"  # 默认降级
@@ -58,9 +61,9 @@ def correct_order(state: ImagesUnderstandState) -> dict:
     for idx, page_path in enumerate(state["user_uploaded_images_path"]):
         if not page_path.is_file():
             raise FileNotFoundError(f"未找到测试图片文件: {page_path}")
-        
+
         encoded_image_data_uri = encode_image_base64(page_path)
-        
+
         # 为了让视觉模型明确感知原始索引，打上文本标签
         multimodal_messages.append({"type": "text", "text": f"--- 这张图片的 original_index 是: {idx} ---"})
         multimodal_messages.append({
@@ -89,7 +92,7 @@ def correct_order(state: ImagesUnderstandState) -> dict:
             clean_json_str = clean_json_str.split("```json")[-1].split("```")[0].strip()
         elif clean_json_str.startswith("```") and "```" in clean_json_str[3:]:
             clean_json_str = clean_json_str.lstrip("```").split("```")[0].strip()
-            
+
         parsed_order_result = json.loads(clean_json_str)
     except json.JSONDecodeError as decode_err:
         print(f"解析视觉模型返回的 JSON 失败: {decode_err}\n原始返回文本: {raw_json_str}")
@@ -98,8 +101,35 @@ def correct_order(state: ImagesUnderstandState) -> dict:
             "reject_reason": "大模型返回的 JSON 格式异常，无法解析",
             "sorted_pages": []
         }
-        
-    return {"correct_order_result": parsed_order_result}
+
+    # 基于解析结果加载并旋转图像转为 Base64 存于内存
+    processed_b64_list = []
+    if parsed_order_result.get("is_valid"):
+        for page in parsed_order_result.get("sorted_pages", []):
+            try:
+                orig_index = page.get("original_index")
+                rotation = page.get("rotation", 0)
+
+                orig_path = state["user_uploaded_images_path"][orig_index]
+
+                with Image.open(orig_path) as img:
+                    # 提示词为“顺时针旋转多少度使文字正向”，而 Pillow rotate 是逆时针，因此转 -rotation 度（expand=True 保证宽高互换后不裁剪）
+                    rotated_img = img.rotate(-rotation, expand=True)
+
+                    if rotated_img.mode in ("RGBA", "P"):
+                        rotated_img = rotated_img.convert("RGB")
+
+                    buffered = io.BytesIO()
+                    rotated_img.save(buffered, format="JPEG", quality=90)
+                    b64_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
+                    processed_b64_list.append(f"data:image/jpeg;base64,{b64_str}")
+            except Exception as e:
+                print(f"处理带有 original_index: {orig_index} 的图片时发生异常: {e}")
+
+    return {
+        "correct_order_result": parsed_order_result,
+        "processed_images_base64": processed_b64_list
+    }
 
 def build_agent():
     graph = StateGraph(ImagesUnderstandState)
@@ -115,12 +145,15 @@ def main() -> None:
     if not img_paths:
         print("用法: python extract_question.py <图片路径1> <图片路径2> ...")
         sys.exit(1)
-        
+
     print(f"正在处理 {len(img_paths)} 张图片，请稍候...")
     final_output = workflow_agent.invoke({"user_uploaded_images_path": img_paths})
-    
+
     print("\n大模型识别及排序结果：")
     print(json.dumps(final_output.get("correct_order_result", {}), indent=2, ensure_ascii=False))
+
+    processed_b64 = final_output.get("processed_images_base64", [])
+    print(f"\n已成功生成并在内存中存入了 {len(processed_b64)} 张经过排序和旋转修正的 Base64 格式图片。")
 
 if __name__ == "__main__":
     main()
