@@ -2,3 +2,6 @@ __pycache__
 
 backend/.venv/
 backend/.env
+# LangGraph API
+.langgraph_api/
+langgraph_api.sqlite*

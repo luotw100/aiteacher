@@ -1,0 +1,7 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "extract_question": "./agents/extract_question.py:workflow_agent"
+  },
+  "env": ".env"
+}

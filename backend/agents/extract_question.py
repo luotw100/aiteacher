@@ -23,20 +23,15 @@ ALIYUN_BASE_URL = os.getenv("ALIYUN_BASE_URL")
 ALIYUN_MODEL_NAME = os.getenv("ALIYUN_MODEL_NAME")
 
 class ImagesUnderstandState(TypedDict):
-    user_uploaded_images_path: List[Path]
+    user_uploaded_images_base64_inputs: List[str]
     correct_order_result: Dict
     processed_images_base64: List[str]
     desc: str
 
-def encode_image_base64(image_path: Path) -> str:
-    with open(image_path, "rb") as image_file:
-        encoded_bytes = base64.b64encode(image_file.read()).decode("utf-8")
-
-    mime_type, _ = mimetypes.guess_type(image_path)
-    if not mime_type or not mime_type.startswith("image/"):
-        mime_type = "image/jpeg"  # 默认降级
-
-    return f"data:{mime_type};base64,{encoded_bytes}"
+def get_base64_data_uri(b64_content: str) -> str:
+    if b64_content.startswith("data:image/"):
+        return b64_content
+    return f"data:image/jpeg;base64,{b64_content}"
 
 CORRECT_ORDER_PROMPT = """
 你是一个试卷图像预处理引擎。用户上传了若干张试卷的照片.
@@ -58,11 +53,12 @@ CORRECT_ORDER_PROMPT = """
 def correct_order(state: ImagesUnderstandState) -> dict:
     multimodal_messages = [{"type": "text", "text": CORRECT_ORDER_PROMPT}]
 
-    for idx, page_path in enumerate(state["user_uploaded_images_path"]):
-        if not page_path.is_file():
-            raise FileNotFoundError(f"未找到测试图片文件: {page_path}")
+    image_inputs = state.get("user_uploaded_images_base64_inputs", [])
+    if not image_inputs:
+        raise ValueError("user_uploaded_images_base64_inputs is empty")
 
-        encoded_image_data_uri = encode_image_base64(page_path)
+    for idx, b64_str in enumerate(image_inputs):
+        encoded_image_data_uri = get_base64_data_uri(b64_str)
 
         # 为了让视觉模型明确感知原始索引，打上文本标签
         multimodal_messages.append({"type": "text", "text": f"--- 这张图片的 original_index 是: {idx} ---"})
@@ -110,9 +106,17 @@ def correct_order(state: ImagesUnderstandState) -> dict:
                 orig_index = page.get("original_index")
                 rotation = page.get("rotation", 0)
 
-                orig_path = state["user_uploaded_images_path"][orig_index]
+                orig_b64_str = image_inputs[orig_index]
+                
+                # 如果有 data: URI 前缀，则去掉以便进行base64解码给Pillow
+                if orig_b64_str.startswith("data:image/"):
+                    b64_data_only = orig_b64_str.split(",", 1)[-1]
+                else:
+                    b64_data_only = orig_b64_str
+                    
+                image_bytes = base64.b64decode(b64_data_only)
 
-                with Image.open(orig_path) as img:
+                with Image.open(io.BytesIO(image_bytes)) as img:
                     # 提示词为“顺时针旋转多少度使文字正向”，而 Pillow rotate 是逆时针，因此转 -rotation 度（expand=True 保证宽高互换后不裁剪）
                     rotated_img = img.rotate(-rotation, expand=True)
 

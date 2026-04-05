@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AiTeacher - 试卷图像预处理</title>
+    <style>
+        body { font-family: -apple-system, sans-serif; max-width: 1000px; margin: 0 auto; padding: 20px; background-color: #f5f7fa; }
+        .card { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); margin-bottom: 20px; }
+        .upload-area { border: 2px dashed #409eff; padding: 40px; text-align: center; border-radius: 8px; cursor: pointer; color: #666; margin-bottom: 20px; }
+        .upload-area:hover { background-color: #ecf5ff; }
+        #fileInput { display: none; }
+        .preview-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 15px; margin-bottom: 20px; }
+        .preview-item { position: relative; }
+        .preview-item img { width: 100%; height: 200px; object-fit: contain; border: 1px solid #ddd; border-radius: 4px; }
+        .btn { background: #409eff; color: white; border: none; padding: 10px 20px; border-radius: 4px; cursor: pointer; font-size: 16px; margin-right: 10px; }
+        .btn:disabled { background: #a0cfff; cursor: not-allowed; }
+        #loading { display: none; color: #409eff; margin-top: 10px; }
+        #resultArea { display: none; }
+        .result-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 20px; margin-top: 20px; }
+        .result-item { border: 1px solid #eee; padding: 10px; border-radius: 4px; text-align: center; }
+        .result-item img { max-width: 100%; border: 1px solid #ddd; }
+        pre { background: #f8f8f8; padding: 15px; border-radius: 4px; overflow-x: auto; }
+    </style>
+</head>
+<body>
+    <h1>AiTeacher - 试卷图像预处理体验</h1>
+    
+    <div class="card">
+        <h2>1. 上传图片</h2>
+        <div class="upload-area" onclick="document.getElementById('fileInput').click()">
+            <p>点击或拖拽图片到这里即可上传(可多选)</p>
+            <input type="file" id="fileInput" multiple accept="image/*" onchange="handleFileSelect(event)">
+        </div>
+        <div class="preview-grid" id="previewGrid"></div>
+        <button class="btn" id="submitBtn" onclick="processImages()" disabled>开始处理</button>
+        <div id="loading">正在处理中，耐心等候（后台大模型运转中...）</div>
+    </div>
+
+    <div class="card" id="resultArea">
+        <h2>2. 处理结果</h2>
+        <div>
+            <h3>模型返回 JSON：</h3>
+            <pre id="jsonResult"></pre>
+        </div>
+        <h3>旋转与排序后的图片矩阵：</h3>
+        <div class="result-grid" id="resultGrid"></div>
+    </div>
+
+    <script>
+        let selectedFiles = [];
+
+        function handleFileSelect(event) {
+            const newFiles = Array.from(event.target.files);
+            selectedFiles = selectedFiles.concat(newFiles);
+            updatePreview();
+        }
+
+        function updatePreview() {
+            const grid = document.getElementById('previewGrid');
+            grid.innerHTML = '';
+            
+            selectedFiles.forEach((file, index) => {
+                const reader = new FileReader();
+                reader.onload = (e) => {
+                    const div = document.createElement('div');
+                    div.className = 'preview-item';
+                    div.innerHTML = `
+                        <img src="${e.target.result}" alt="preview">
+                        <div style="text-align:center; font-size:12px; margin-top:5px;">Original Index: ${index}</div>
+                    `;
+                    grid.appendChild(div);
+                };
+                reader.readAsDataURL(file);
+            });
+            
+            document.getElementById('submitBtn').disabled = selectedFiles.length === 0;
+        }
+
+        // 文件转 Base64 辅助函数
+        function fileToBase64(file) {
+            return new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.readAsDataURL(file);
+                reader.onload = () => resolve(reader.result);
+                reader.onerror = error => reject(error);
+            });
+        }
+
+        async function processImages() {
+            const btn = document.getElementById('submitBtn');
+            const loading = document.getElementById('loading');
+            const resultArea = document.getElementById('resultArea');
+            
+            btn.disabled = true;
+            loading.style.display = 'block';
+            resultArea.style.display = 'none';
+
+            try {
+                // 1. 将所有图片转为 Base64（因为服务端目前的State接受文件路径，这不适合纯前端传值）
+                // 我们需要用 Base64 给 langgraph api 投喂！
+                console.log("准备转换 Base64...");
+                const base64Images = await Promise.all(selectedFiles.map(file => fileToBase64(file)));
+                
+                // === 注意：这就要求我们对 python agent 里关于 List[Path] 的状态逻辑做少量修改 ===
+                // 因为 langgraph studio 和这个纯 Web API，都只能接受 JSON Payload！
+                
+                // 2. 调用 LangGraph API 创建执行线程
+                const createThreadRes = await fetch("http://127.0.0.1:2024/threads", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({})
+                });
+                const thread = await createThreadRes.json();
+                
+                // 3. 运行 Agent
+                // 我们把 base64Images 传过去给状态 "user_uploaded_images_base64_inputs"
+                const runRes = await fetch(`http://127.0.0.1:2024/threads/${thread.thread_id}/runs`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        assistant_id: "extract_question", 
+                        input: { 
+                           // 这里的状态键名字需要和 Python 里的 TypedDict 对应
+                           "user_uploaded_images_base64_inputs": base64Images 
+                        }
+                    })
+                });
+                
+                const runInfo = await runRes.json();
+                
+                // 4. 轮询直到运行结束取出结果
+                await pollRunResult(thread.thread_id, runInfo.run_id);
+                
+            } catch (error) {
+                alert("请求出错：" + error.message);
+                console.error(error);
+            } finally {
+                btn.disabled = false;
+                loading.style.display = 'none';
+            }
+        }
+        
+        async function pollRunResult(threadId, runId) {
+            const maxWait = 60000;
+            const step = 2000;
+            let waited = 0;
+            
+            while(waited < maxWait) {
+                const res = await fetch(`http://127.0.0.1:2024/threads/${threadId}/runs/${runId}`);
+                const data = await res.json();
+                
+                if (data.status === "success") {
+                    // 获取最终状态
+                    const stateRes = await fetch(`http://127.0.0.1:2024/threads/${threadId}/state`);
+                    const stateData = await stateRes.json();
+                    renderResult(stateData.values);
+                    return;
+                } else if (data.status === "error" || data.status === "failed") {
+                    throw new Error("模型执行失败" + (data.error || "未知原因"));
+                }
+                
+                await new Promise(r => setTimeout(r, step));
+                waited += step;
+            }
+            throw new Error("处理超时");
+        }
+
+        function renderResult(stateValues) {
+            document.getElementById('resultArea').style.display = 'block';
+            
+            // 展示 JSON
+            const jsonOutput = stateValues.correct_order_result || {};
+            document.getElementById('jsonResult').textContent = JSON.stringify(jsonOutput, null, 2);
+            
+            // 展示处理后的排序数组
+            const grid = document.getElementById('resultGrid');
+            grid.innerHTML = '';
+            
+            const processedImages = stateValues.processed_images_base64 || [];
+            processedImages.forEach((b64, i) => {
+                const div = document.createElement('div');
+                div.className = 'result-item';
+                div.innerHTML = `
+                    <img src="${b64}" alt="processed_image">
+                    <p>最终顺序：${i + 1}</p>
+                `;
+                grid.appendChild(div);
+            });
+        }
+    </script>
+</body>
+</html>
