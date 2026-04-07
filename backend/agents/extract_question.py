@@ -107,13 +107,13 @@ def correct_order(state: ImagesUnderstandState) -> dict:
                 rotation = page.get("rotation", 0)
 
                 orig_b64_str = image_inputs[orig_index]
-                
+
                 # 如果有 data: URI 前缀，则去掉以便进行base64解码给Pillow
                 if orig_b64_str.startswith("data:image/"):
                     b64_data_only = orig_b64_str.split(",", 1)[-1]
                 else:
                     b64_data_only = orig_b64_str
-                    
+
                 image_bytes = base64.b64decode(b64_data_only)
 
                 with Image.open(io.BytesIO(image_bytes)) as img:
