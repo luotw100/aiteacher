@@ -23,15 +23,9 @@ ALIYUN_BASE_URL = os.getenv("ALIYUN_BASE_URL")
 ALIYUN_MODEL_NAME = os.getenv("ALIYUN_MODEL_NAME")
 
 class ImagesUnderstandState(TypedDict):
-    user_uploaded_images_base64_inputs: List[str]
-    correct_order_result: Dict
-    processed_images_base64: List[str]
-    desc: str
-
-def get_base64_data_uri(b64_content: str) -> str:
-    if b64_content.startswith("data:image/"):
-        return b64_content
-    return f"data:image/jpeg;base64,{b64_content}"
+    user_uploaded_images: List[str] # base64 encoded images from user upload
+    correct_order_result: Dict # the parsed JSON result from the vision model about image validity, order and rotation
+    ordered_images: List[str] # base64 encoded images after rotation correction
 
 CORRECT_ORDER_PROMPT = """
 你是一个试卷图像预处理引擎。用户上传了若干张试卷的照片.
@@ -42,7 +36,7 @@ CORRECT_ORDER_PROMPT = """
 
 第二步:如果合格,请根据图片页码或上下文给出正确的阅读顺序,并判断每张图需要顺时针旋转多少度(0, 90, 180, 270)才能使文字正向朝上.
 
-严格只输出以下JSON,不要有任何其他解释文字:
+严格只输出以下格式的JSON,不要有任何其他解释文字,你的输出第一个字符必须是"{"，最后一个字符必须是"}":
 {
   "is_valid": true or false,
   "reject_reason": "如果不合格的原因,例如第x张图片模糊,第x张图片非法试卷照片等",
@@ -50,22 +44,23 @@ CORRECT_ORDER_PROMPT = """
 }
 """
 
-def correct_order(state: ImagesUnderstandState) -> dict:
+def correct_order(state: ImagesUnderstandState) -> Dict:
     multimodal_messages = [{"type": "text", "text": CORRECT_ORDER_PROMPT}]
 
-    image_inputs = state.get("user_uploaded_images_base64_inputs", [])
+    image_inputs = state.get("user_uploaded_images", [])
     if not image_inputs:
-        raise ValueError("user_uploaded_images_base64_inputs is empty")
+        raise ValueError("user_uploaded_images is empty")
 
     for idx, b64_str in enumerate(image_inputs):
-        encoded_image_data_uri = get_base64_data_uri(b64_str)
+        if not b64_str.startswith("data:image/jpeg;base64,"):
+            raise ValueError(f"第 {idx} 张图片的 Base64 字符串格式不正确，必须以 'data:image/jpeg;base64,' 开头")
 
         # 为了让视觉模型明确感知原始索引，打上文本标签
         multimodal_messages.append({"type": "text", "text": f"--- 这张图片的 original_index 是: {idx} ---"})
         multimodal_messages.append({
             "type": "image_url",
             "image_url": {
-                "url": encoded_image_data_uri
+                "url": b64_str
             }
         })
 
@@ -79,24 +74,13 @@ def correct_order(state: ImagesUnderstandState) -> dict:
 
     human_req = HumanMessage(content=multimodal_messages)
     vision_response = vision_model.invoke([human_req])
-    raw_json_str = vision_response.content.strip()
+    vision_response = vision_response.content.strip()
 
-    # 提取可能的 Markdown JSON 代码块内容
+    # 将模型输出的 JSON 字符串解析为 Python 字典
     try:
-        clean_json_str = raw_json_str
-        if "```json" in clean_json_str:
-            clean_json_str = clean_json_str.split("```json")[-1].split("```")[0].strip()
-        elif clean_json_str.startswith("```") and "```" in clean_json_str[3:]:
-            clean_json_str = clean_json_str.lstrip("```").split("```")[0].strip()
-
-        parsed_order_result = json.loads(clean_json_str)
-    except json.JSONDecodeError as decode_err:
-        print(f"解析视觉模型返回的 JSON 失败: {decode_err}\n原始返回文本: {raw_json_str}")
-        parsed_order_result = {
-            "is_valid": False,
-            "reject_reason": "大模型返回的 JSON 格式异常，无法解析",
-            "sorted_pages": []
-        }
+        parsed_order_result = json.loads(vision_response)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"无法解析模型输出为 JSON: {e}\n模型原始输出: {vision_response}")
 
     # 基于解析结果加载并旋转图像转为 Base64 存于内存
     processed_b64_list = []
@@ -132,7 +116,7 @@ def correct_order(state: ImagesUnderstandState) -> dict:
 
     return {
         "correct_order_result": parsed_order_result,
-        "processed_images_base64": processed_b64_list
+        "ordered_images": processed_b64_list
     }
 
 def build_agent():
