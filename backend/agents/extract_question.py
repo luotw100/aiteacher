@@ -78,12 +78,14 @@ QUESTION_EXTRACTION_PROMPT = """
     - 如果某道大题被一分为二，请合并为同一个 question，提供两个 boxes。
 3. 只保留内容完整的大题。如果有题目明显在当前页没完全显示且无法从其它页接续，必须丢弃并在 dropped_questions 中说明。
 4. 返回的 box 必须使用原图的绝对像素坐标。
-    - 你应“严格参考属于同一题的 OCR 文本框”将它们的坐标外包围框计算出来（取最小的 x_min, y_min，最大的 x_max, y_max），并作为包围该部分内容的最终 box 返回。
-    - 这个外包围框必须覆盖这道题的所有文本内容。
+    - 你应“综合参考 OCR 文本框和图片本身的视觉信息”。OCR 可能会漏识别（比如漏掉第一行的题号、漏掉图片、漏掉选项最后几个字等），因此你不能只依赖 OCR 结果。你的外包围框必须覆盖这道题的全部可视内容（包括文本、公式、插图、选项的所有行等）。
+    - 确保将该题附带的图片/示意图也框进这道题内。如果某个选项分成了多行，确保最后一行（哪怕只有几个字）也被包含在内。
+    - 取包含该题所有元素的最小 x_min, y_min 和最大 x_max, y_max 作为最终 box 返回。
     - 输出时必须直接返回整数绝对像素坐标。
     - x1, y1 是左上角，x2, y2 是右下角，必须满足 0 <= x1 < x2，0 <= y1 < y2。
 5. box 要尽量紧贴该大题在当前页面上的全部可见内容外接矩形。
-    - 不要为了求稳而给出过大的宽松框。不要把大块空白边距、相邻题目一并框进去。
+    - 哪怕 OCR 漏掉了某些字或图，你作为多模态大模型也能“看”到它们，必须将它们纳入框内。
+    - 但不要为了求稳而给出过大的宽松框。不要把大块空白边距、相邻题目一并框进去。
 
 严格只输出以下 JSON 结构，不要有任何其他解释文字，你的输出第一个字符必须是 "{"，最后一个字符必须是 "}"：
 {
@@ -262,8 +264,10 @@ def normalize_order_result(parsed_order_result: Dict[str, Any], total_images: in
         raise ValueError("模型输出中的 is_valid 必须是布尔值")
 
     reject_reason = parsed_order_result.get("reject_reason", "")
+    if reject_reason is None:
+        reject_reason = ""
     if not isinstance(reject_reason, str):
-        raise ValueError("模型输出中的 reject_reason 必须是字符串")
+        reject_reason = str(reject_reason)
 
     sorted_pages = parsed_order_result.get("sorted_pages", [])
     if not isinstance(sorted_pages, list):
