@@ -1,12 +1,13 @@
+import argparse
 import sys
 import os
 import json
 import base64
 import io
 import binascii
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 from pathlib import Path
-from typing import Any, TypedDict, Dict, List
+from typing import Any, TypedDict, Dict, List, Tuple
 
 from dotenv import load_dotenv
 from langgraph.graph import END, START, StateGraph
@@ -24,20 +25,32 @@ ALIYUN_MODEL_NAME = os.getenv("ALIYUN_MODEL_NAME")
 
 JPEG_DATA_URI_PREFIX = "data:image/jpeg;base64,"
 VALID_ROTATIONS = {0, 90, 180, 270}
+QUESTION_COORDINATE_MAX = 1000
+OVERLAY_COLOR_PALETTE = [
+    (230, 57, 70),
+    (29, 78, 216),
+    (46, 125, 50),
+    (245, 124, 0),
+    (126, 87, 194),
+]
 
 class ImagesUnderstandState(TypedDict):
     user_uploaded_images: List[str] # base64 encoded images from user upload
-    correct_order_result: Dict # the parsed JSON result from the vision model about image validity, order and rotation
+    correct_order_result: Dict[str, Any] # the parsed JSON result from the vision model about image validity, order and rotation
     ordered_images: List[str] # base64 encoded images after rotation correction
+    question_extraction_result: Dict[str, Any] # the parsed JSON result for retained and dropped questions
+    extracted_questions: List[Dict[str, Any]] # complete big questions with N boxes in normalized coordinates
 
 CORRECT_ORDER_PROMPT = """
 你是一个试卷图像预处理引擎。用户上传了若干张试卷的照片.
+注意：单张图片里可能会露出相邻页面的一小部分残片。你只能根据主体页面来判断合法性、顺序和旋转角度，不要被边缘露出的相邻页残片干扰。主体页面通常是画面中占比最大的那一页，并且其页码在页面底部角落能清晰看到。
 第一步:请确保这是合法的试卷照片上传,你需要检查图片的质量和内容是否满足以下要求:
 1. 图片必须清晰可见,文字必须清晰可读。
 2. 图片必须包含完整的试卷内容,不能有大面积的遮挡或残缺或反光或暗光。
 3. 图片必须是正确的试卷照片,不能包含其他无关内容。
 
 第二步:如果合格,请根据图片页码或上下文给出正确的阅读顺序,并判断每张图需要顺时针旋转多少度(0, 90, 180, 270)才能使文字正向朝上.
+如果主体页面中的中文正文已经是正常竖直阅读方向，rotation 必须为 0。
 
 严格只输出以下格式的JSON,不要有任何其他解释文字,你的输出第一个字符必须是"{"，最后一个字符必须是"}":
 {
@@ -45,6 +58,60 @@ CORRECT_ORDER_PROMPT = """
   "reject_reason": "如果不合格的原因,例如第x张图片模糊,第x张图片非法试卷照片等",
   "sorted_pages": [{"original_index": 0, "rotation": 90}]
 }
+"""
+
+QUESTION_EXTRACTION_PROMPT = f"""
+你是一个试卷题目定位引擎。
+输入是若干张已经完成排序和方向矫正的试卷页面图片，它们已经是最终阅读顺序。每张图都会明确标出自己的 page_index。
+注意：由于是翻开的书本拍照，单张图片里可能会露出相邻页面的一小部分残片。你只能分析当前图片中的主体页面，不要分析边缘露出的相邻页残片。主体页面通常是画面中占比最大的那一页，并且其页码在页面底部角落能清晰看到。
+注意：页面内部的真实阅读顺序要以题号推进关系和内容续接关系为准，不要机械按全局坐标从上到下排序。
+
+你的任务是输出“完整大题”的坐标列表，规则如下：
+1. 按大题识别，不按小题识别。比如 17.(1)(2) 只算一道题。
+    - question_label 必须优先使用卷面上该大题明确可见的题号或稳定编号。
+    - 只有题干起始处清晰可见的正式大题编号，才能作为 question_label，例如“1.”、“2.”、“3.”这类编号。
+    - 如果题目本体完整，但没有明确可见的正式题号，也仍然要保留这道题；此时 question_label 不要乱猜数字，而要使用该题开头最有辨识度的前导文本作为稳定标签。
+    - 对于这种无正式题号但完整的题，优先使用题目开头紧邻题干的括号来源文字、年份地区信息、或第一段短语作为 question_label。比如题目开头是“(2024湖南娄底二模)”，那就直接把 question_label 设为“(2024湖南娄底二模)”。
+    - 不要把标题附近的小型索引、知识点编号、页码、答案页码、专题序号、题组编号、T1/T2/T3 之类的提示文字当作题号。
+    - 不要把栏目标题、专题标题、小节标题、页眉文字当作 question_label，例如“考法领航”“五年高考”“微专题”等都不是题号。
+    - 只有当一个区域既没有明确题号，也不能唯一判断为上一道已编号题目的续接，同时又无法提取出稳定的前导文本标签时，才可以丢弃；不能仅仅因为“没有数字题号”就丢弃一整道完整题。
+2. 一道大题可以对应 N 个方框：
+     - 跨两页或多页的同一道题，要输出同一个 question 对象，并给出多个 boxes。
+     - 同一页上如果题干、配图、表格等内容彼此分离，也要拆成多个 boxes。
+    - 同一道题的多个 boxes 在空间上可以不连续，甚至后续 box 的 y1 可能小于前一个 box 的 y1；这并不代表它们不是同一道题。
+    - 如果某道题在左侧栏或页面下半部开始，而其后半段续接到右侧栏或页面上半部，只要内容显然承接且下一道题号尚未开始，就必须把这些区域合并为同一道题。
+    - 典型例子：左下出现“3.”并开始题干，右上区域没有新的“4.”题号但明显是该题后半段，右下才出现“4.”，那么应输出 question_label="3" 且 boxes 为两个框，分别对应左下和右上；question_label="4" 只对应右下。
+    - 对于无题号区域，如果能根据上下文唯一判断它是上一道已编号大题的续接，可以并入上一题；如果不能唯一判断，但它本身是一道完整题，则应保留为独立 question，并使用可辨识的前导文本作为 question_label；如果既不能唯一判断归属、也没有足够稳定的前导文本标签，才不能作为独立题目保留。
+    - 同一页内不要生成两个彼此独立但 question_label 相同的 question。若两个区域都属于“第3题”，就必须合并为同一个 question 的两个 boxes；若无法合并，则说明至少有一个区域的题号判断不可靠，应将不可靠区域丢弃而不是保留成重复题号。
+    - 只有在你可以明确判断多个区域属于同一道大题时，才能把它们放进同一个 question；如果不确定，宁可拆成不同 question，也不要误合并。
+3. 只保留内容完整的大题。以下情况都算内容不全，必须整题丢弃，不能出现在 questions 里：
+     - 页面边缘裁切、遮挡、反光、暗光导致题目不完整。
+     - 只看到一道题的上半部分或下半部分。
+     - 这道题明显需要上一页或下一页才能完整，但提供的图片里缺失了对应部分。
+    - 这道题属于相邻页面残片，而不是当前主体页面。
+4. 返回的 box 坐标必须使用相对于当前页面的归一化整数坐标，范围是 0 到 {QUESTION_COORDINATE_MAX}。
+     - x1, y1 是左上角
+     - x2, y2 是右下角
+     - 必须满足 0 <= x1 < x2 <= {QUESTION_COORDINATE_MAX}，0 <= y1 < y2 <= {QUESTION_COORDINATE_MAX}
+5. box 要尽量完整覆盖该大题在当前页面上的全部可见内容，包括题号、题干、小题、配图、表格、作答区域等属于该大题的内容。
+6. questions 只包含最终保留的大题，按真实阅读顺序输出；每个 question 内的 boxes 也按真实阅读顺序输出。不要按几何坐标大小排序。
+7. dropped_questions 里列出你识别到但因为内容不全而丢弃的大题，并写明 reason。如果无法明确题号，可以使用简短占位标签，如 "unknown_1"。
+
+严格只输出以下 JSON 结构，不要有任何其他解释文字，你的输出第一个字符必须是 "{{"，最后一个字符必须是 "}}"：
+{{
+    "questions": [
+        {{
+            "question_label": "17",
+            "boxes": [
+                {{"page_index": 0, "x1": 120, "y1": 180, "x2": 930, "y2": 820}},
+                {{"page_index": 1, "x1": 60, "y1": 0, "x2": 940, "y2": 260}}
+            ]
+        }}
+    ],
+    "dropped_questions": [
+        {{"question_label": "18", "reason": "第1页底部只有半道题，缺少下一页内容"}}
+    ]
+}}
 """
 
 
@@ -61,6 +128,17 @@ def ensure_model_config() -> None:
     if missing_env_vars:
         missing = ", ".join(missing_env_vars)
         raise RuntimeError(f"缺少环境变量配置: {missing}")
+
+
+def create_vision_model(max_tokens: int) -> ChatOpenAI:
+    ensure_model_config()
+    return ChatOpenAI(
+        api_key=ALIYUN_API_KEY,
+        base_url=ALIYUN_BASE_URL,
+        model=ALIYUN_MODEL_NAME,
+        max_tokens=max_tokens,
+        temperature=0.0,
+    )
 
 
 def encode_jpeg_file_to_data_uri(image_path: Path) -> str:
@@ -107,6 +185,12 @@ def decode_jpeg_data_uri(image_data_uri: str, image_index: int) -> bytes:
     return image_bytes
 
 
+def decode_jpeg_data_uri_to_image(image_data_uri: str, image_index: int) -> Image.Image:
+    image_bytes = decode_jpeg_data_uri(image_data_uri, image_index)
+    with Image.open(io.BytesIO(image_bytes)) as img:
+        return img.convert("RGBA")
+
+
 def extract_text_content(content: Any) -> str:
     if isinstance(content, str):
         return content.strip()
@@ -142,6 +226,43 @@ def normalize_json_text(raw_text: str) -> str:
         return stripped_text[json_start : json_end + 1]
 
     return stripped_text
+
+
+def invoke_vision_json(
+    prompt: str,
+    image_inputs: List[str],
+    index_label: str,
+    response_label: str,
+    max_tokens: int,
+) -> Dict[str, Any]:
+    if not image_inputs:
+        raise ValueError(f"{response_label}的图片输入为空")
+
+    multimodal_messages = [{"type": "text", "text": prompt}]
+    for idx, b64_str in enumerate(image_inputs):
+        multimodal_messages.append(
+            {"type": "text", "text": f"--- 这张图片的 {index_label} 是: {idx} ---"}
+        )
+        multimodal_messages.append({
+            "type": "image_url",
+            "image_url": {"url": b64_str},
+        })
+
+    vision_model = create_vision_model(max_tokens=max_tokens)
+    vision_response = vision_model.invoke([HumanMessage(content=multimodal_messages)])
+    vision_response_text = normalize_json_text(extract_text_content(vision_response.content))
+
+    try:
+        parsed_result = json.loads(vision_response_text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"无法解析{response_label}为 JSON: {exc}\n模型原始输出: {vision_response_text}"
+        ) from exc
+
+    if not isinstance(parsed_result, dict):
+        raise ValueError(f"{response_label}必须是 JSON 对象")
+
+    return parsed_result
 
 
 def normalize_order_result(parsed_order_result: Dict[str, Any], total_images: int) -> Dict[str, Any]:
@@ -184,9 +305,357 @@ def normalize_order_result(parsed_order_result: Dict[str, Any], total_images: in
         "sorted_pages": normalized_pages,
     }
 
-def correct_order(state: ImagesUnderstandState) -> Dict:
-    multimodal_messages = [{"type": "text", "text": CORRECT_ORDER_PROMPT}]
 
+def normalize_question_label(raw_label: Any, fallback_prefix: str, index: int) -> str:
+    if raw_label is None:
+        return f"{fallback_prefix}_{index + 1}"
+
+    if not isinstance(raw_label, str):
+        raw_label = str(raw_label)
+
+    normalized_label = raw_label.strip()
+    if not normalized_label:
+        return f"{fallback_prefix}_{index + 1}"
+
+    return normalized_label
+
+
+def normalize_coordinate_value(
+    raw_value: Any,
+    field_name: str,
+    question_index: int,
+    box_index: int,
+) -> int:
+    if isinstance(raw_value, bool) or not isinstance(raw_value, (int, float)):
+        raise ValueError(
+            f"questions[{question_index}].boxes[{box_index}].{field_name} 必须是数字"
+        )
+
+    normalized_value = int(round(raw_value))
+    if not 0 <= normalized_value <= QUESTION_COORDINATE_MAX:
+        raise ValueError(
+            f"questions[{question_index}].boxes[{box_index}].{field_name} 必须在 0 到 {QUESTION_COORDINATE_MAX} 之间"
+        )
+
+    return normalized_value
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="排序试卷图片并提取题目坐标")
+    parser.add_argument("images", nargs="+", help="输入的 JPEG 图片路径")
+    parser.add_argument(
+        "-o",
+        "--output-dir",
+        dest="output_dir",
+        help="若提供则把题目框叠加后的页面图导出到该目录",
+    )
+    return parser.parse_args()
+
+
+def normalize_to_pixel_coordinates(box: Dict[str, int], width: int, height: int) -> Tuple[int, int, int, int]:
+    left = max(0, min(width - 1, int(box["x1"] * width / QUESTION_COORDINATE_MAX)))
+    top = max(0, min(height - 1, int(box["y1"] * height / QUESTION_COORDINATE_MAX)))
+    right = max(0, min(width - 1, int(box["x2"] * width / QUESTION_COORDINATE_MAX)))
+    bottom = max(0, min(height - 1, int(box["y2"] * height / QUESTION_COORDINATE_MAX)))
+
+    if right <= left:
+        right = min(width - 1, left + 1)
+    if bottom <= top:
+        bottom = min(height - 1, top + 1)
+
+    return left, top, right, bottom
+
+
+def load_overlay_font(font_size: int) -> ImageFont.ImageFont:
+    candidate_paths = [
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    ]
+
+    for candidate_path in candidate_paths:
+        if Path(candidate_path).is_file():
+            try:
+                return ImageFont.truetype(candidate_path, font_size)
+            except OSError:
+                continue
+
+    return ImageFont.load_default()
+
+
+def build_overlay_output_name(
+    page_index: int,
+    img_paths: List[Path],
+    correct_order_result: Dict[str, Any],
+) -> str:
+    sorted_pages = correct_order_result.get("sorted_pages", [])
+    if page_index < len(sorted_pages):
+        original_index = sorted_pages[page_index].get("original_index")
+        if isinstance(original_index, int) and 0 <= original_index < len(img_paths):
+            stem = img_paths[original_index].stem
+            return f"page_{page_index + 1:02d}_{stem}_overlay.jpg"
+
+    return f"page_{page_index + 1:02d}_overlay.jpg"
+
+
+def export_question_overlays(
+    output_dir: Path,
+    ordered_images: List[str],
+    extracted_questions: List[Dict[str, Any]],
+    img_paths: List[Path],
+    correct_order_result: Dict[str, Any],
+) -> List[Path]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    ordered_page_images = [
+        decode_jpeg_data_uri_to_image(image_data_uri, page_index)
+        for page_index, image_data_uri in enumerate(ordered_images)
+    ]
+    page_overlays = [Image.new("RGBA", image.size, (0, 0, 0, 0)) for image in ordered_page_images]
+    border_drawers = [ImageDraw.Draw(overlay, "RGBA") for overlay in page_overlays]
+
+    base_width = ordered_page_images[0].width if ordered_page_images else 0
+    font = load_overlay_font(max(18, base_width // 48 if base_width else 18))
+    border_width = max(5, base_width // 220 if base_width else 5)
+    text_padding = max(8, border_width + 2)
+
+    for question_index, question in enumerate(extracted_questions):
+        color = OVERLAY_COLOR_PALETTE[question_index % len(OVERLAY_COLOR_PALETTE)]
+        fill_color = (*color, 72)
+        border_color = (*color, 255)
+        text_fill = (255, 255, 255, 255)
+        text_background = (*color, 230)
+
+        boxes = question.get("boxes", [])
+        total_boxes = len(boxes)
+        question_label = str(question.get("question_label", question.get("question_id", question_index + 1)))
+        for box_index, box in enumerate(boxes):
+            page_index = box["page_index"]
+            image = ordered_page_images[page_index]
+            drawer = border_drawers[page_index]
+            left, top, right, bottom = normalize_to_pixel_coordinates(box, image.width, image.height)
+
+            drawer.rectangle(
+                [(left, top), (right, bottom)],
+                fill=fill_color,
+                outline=border_color,
+                width=border_width,
+            )
+
+            label_text = f"题目:{question_label}\n{box_index + 1}/{total_boxes}"
+            text_bbox = drawer.multiline_textbbox((0, 0), label_text, font=font, spacing=4)
+            text_width = text_bbox[2] - text_bbox[0]
+            text_height = text_bbox[3] - text_bbox[1]
+
+            text_left = left + border_width
+            text_top = max(0, top - text_height - text_padding * 2)
+            if text_top == 0 and top + text_height + text_padding * 2 < image.height:
+                text_top = top + border_width
+
+            text_right = min(image.width - 1, text_left + text_width + text_padding * 2)
+            text_bottom = min(image.height - 1, text_top + text_height + text_padding * 2)
+
+            if text_right - text_left < text_width + text_padding * 2:
+                text_left = max(0, image.width - (text_width + text_padding * 2))
+                text_right = min(image.width - 1, text_left + text_width + text_padding * 2)
+
+            drawer.rectangle(
+                [(text_left, text_top), (text_right, text_bottom)],
+                fill=text_background,
+            )
+            drawer.multiline_text(
+                (text_left + text_padding, text_top + text_padding),
+                label_text,
+                font=font,
+                fill=text_fill,
+                spacing=4,
+            )
+
+    saved_files = []
+    for page_index, image in enumerate(ordered_page_images):
+        composited_image = Image.alpha_composite(image, page_overlays[page_index]).convert("RGB")
+        output_path = output_dir / build_overlay_output_name(page_index, img_paths, correct_order_result)
+        composited_image.save(output_path, format="JPEG", quality=95)
+        saved_files.append(output_path)
+
+    return saved_files
+
+
+def normalize_question_box(
+    raw_box: Any,
+    total_pages: int,
+    question_index: int,
+    box_index: int,
+) -> Dict[str, int]:
+    if not isinstance(raw_box, dict):
+        raise ValueError(f"questions[{question_index}].boxes[{box_index}] 必须是对象")
+
+    page_index = raw_box.get("page_index")
+    if isinstance(page_index, bool) or not isinstance(page_index, int):
+        raise ValueError(f"questions[{question_index}].boxes[{box_index}].page_index 必须是整数")
+    if not 0 <= page_index < total_pages:
+        raise ValueError(f"questions[{question_index}].boxes[{box_index}].page_index 超出范围")
+
+    x1 = normalize_coordinate_value(raw_box.get("x1"), "x1", question_index, box_index)
+    y1 = normalize_coordinate_value(raw_box.get("y1"), "y1", question_index, box_index)
+    x2 = normalize_coordinate_value(raw_box.get("x2"), "x2", question_index, box_index)
+    y2 = normalize_coordinate_value(raw_box.get("y2"), "y2", question_index, box_index)
+
+    if x1 >= x2 or y1 >= y2:
+        raise ValueError(
+            f"questions[{question_index}].boxes[{box_index}] 的坐标必须满足 x1 < x2 且 y1 < y2"
+        )
+
+    return {
+        "page_index": page_index,
+        "x1": x1,
+        "y1": y1,
+        "x2": x2,
+        "y2": y2,
+    }
+
+
+def normalize_dropped_questions(raw_dropped_questions: Any) -> List[Dict[str, str]]:
+    if raw_dropped_questions is None:
+        return []
+
+    if not isinstance(raw_dropped_questions, list):
+        raise ValueError("模型输出中的 dropped_questions 必须是数组")
+
+    normalized_dropped_questions = []
+    for dropped_index, raw_dropped_question in enumerate(raw_dropped_questions):
+        if isinstance(raw_dropped_question, str):
+            normalized_dropped_questions.append({
+                "question_label": f"unknown_{dropped_index + 1}",
+                "reason": raw_dropped_question.strip() or "模型判定为内容不全",
+            })
+            continue
+
+        if not isinstance(raw_dropped_question, dict):
+            raise ValueError(f"dropped_questions[{dropped_index}] 必须是对象或字符串")
+
+        question_label = normalize_question_label(
+            raw_dropped_question.get("question_label"),
+            "unknown",
+            dropped_index,
+        )
+        reason = raw_dropped_question.get("reason")
+        if not isinstance(reason, str) or not reason.strip():
+            reason = "模型判定为内容不全"
+
+        normalized_dropped_questions.append({
+            "question_label": question_label,
+            "reason": reason.strip(),
+        })
+
+    return normalized_dropped_questions
+
+
+def normalize_question_extraction_result(
+    parsed_question_result: Dict[str, Any],
+    total_pages: int,
+) -> Dict[str, Any]:
+    raw_questions = parsed_question_result.get("questions", [])
+    if not isinstance(raw_questions, list):
+        raise ValueError("模型输出中的 questions 必须是数组")
+
+    normalized_questions = []
+    seen_question_signatures = set()
+    for question_index, raw_question in enumerate(raw_questions):
+        if not isinstance(raw_question, dict):
+            raise ValueError(f"questions[{question_index}] 必须是对象")
+
+        raw_boxes = raw_question.get("boxes", [])
+        if not isinstance(raw_boxes, list) or not raw_boxes:
+            raise ValueError(f"questions[{question_index}].boxes 必须是非空数组")
+
+        normalized_boxes = []
+        seen_boxes = set()
+        for box_index, raw_box in enumerate(raw_boxes):
+            normalized_box = normalize_question_box(raw_box, total_pages, question_index, box_index)
+            box_signature = (
+                normalized_box["page_index"],
+                normalized_box["x1"],
+                normalized_box["y1"],
+                normalized_box["x2"],
+                normalized_box["y2"],
+            )
+            if box_signature in seen_boxes:
+                raise ValueError(f"questions[{question_index}] 出现重复 box")
+            seen_boxes.add(box_signature)
+            normalized_boxes.append(normalized_box)
+
+        question_label = normalize_question_label(
+            raw_question.get("question_label"),
+            "question",
+            question_index,
+        )
+        page_indexes = list(dict.fromkeys(box["page_index"] for box in normalized_boxes))
+
+        question_signature = (
+            question_label,
+            tuple(
+                (
+                    box["page_index"],
+                    box["x1"],
+                    box["y1"],
+                    box["x2"],
+                    box["y2"],
+                )
+                for box in normalized_boxes
+            ),
+        )
+        if question_signature in seen_question_signatures:
+            raise ValueError("模型输出中出现重复 question")
+        seen_question_signatures.add(question_signature)
+
+        normalized_questions.append({
+            "question_label": question_label,
+            "page_indexes": page_indexes,
+            "boxes": normalized_boxes,
+        })
+
+    extracted_questions = []
+    for question_index, normalized_question in enumerate(normalized_questions):
+        extracted_questions.append({
+            "question_id": f"question_{question_index + 1}",
+            **normalized_question,
+        })
+
+    dropped_questions = normalize_dropped_questions(parsed_question_result.get("dropped_questions", []))
+    total_boxes = sum(len(question["boxes"]) for question in extracted_questions)
+
+    return {
+        "extracted_questions": extracted_questions,
+        "question_extraction_result": {
+            "coordinate_system": f"normalized_0_to_{QUESTION_COORDINATE_MAX}",
+            "ordered_page_count": total_pages,
+            "question_count": len(extracted_questions),
+            "box_count": total_boxes,
+            "dropped_questions": dropped_questions,
+        },
+    }
+
+
+def build_empty_question_result(ordered_page_count: int, skipped_reason: str = "") -> Dict[str, Any]:
+    question_extraction_result: Dict[str, Any] = {
+        "coordinate_system": f"normalized_0_to_{QUESTION_COORDINATE_MAX}",
+        "ordered_page_count": ordered_page_count,
+        "question_count": 0,
+        "box_count": 0,
+        "dropped_questions": [],
+    }
+    if skipped_reason:
+        question_extraction_result["skipped_reason"] = skipped_reason
+
+    return {
+        "extracted_questions": [],
+        "question_extraction_result": question_extraction_result,
+    }
+
+def correct_order(state: ImagesUnderstandState) -> Dict:
     image_inputs = state.get("user_uploaded_images", [])
     if not image_inputs:
         raise ValueError("user_uploaded_images is empty")
@@ -194,38 +663,15 @@ def correct_order(state: ImagesUnderstandState) -> Dict:
     image_bytes_list = []
     for idx, b64_str in enumerate(image_inputs):
         image_bytes_list.append(decode_jpeg_data_uri(b64_str, idx))
-
-        # 为了让视觉模型明确感知原始索引，打上文本标签
-        multimodal_messages.append({"type": "text", "text": f"--- 这张图片的 original_index 是: {idx} ---"})
-        multimodal_messages.append({
-            "type": "image_url",
-            "image_url": {
-                "url": b64_str
-            }
-        })
-
-    ensure_model_config()
-    vision_model = ChatOpenAI(
-        api_key=ALIYUN_API_KEY,
-        base_url=ALIYUN_BASE_URL,
-        model=ALIYUN_MODEL_NAME,
+    parsed_order_result = invoke_vision_json(
+        prompt=CORRECT_ORDER_PROMPT,
+        image_inputs=image_inputs,
+        index_label="original_index",
+        response_label="排序结果",
         max_tokens=2048,
-        temperature=0.1,  # 降低温度使 JSON 输出更稳定
     )
-
-    human_req = HumanMessage(content=multimodal_messages)
-    vision_response = vision_model.invoke([human_req])
-    vision_response_text = normalize_json_text(extract_text_content(vision_response.content))
-
-    # 将模型输出的 JSON 字符串解析为 Python 字典
-    try:
-        parsed_order_result = json.loads(vision_response_text)
-    except json.JSONDecodeError as e:
-        raise ValueError(f"无法解析模型输出为 JSON: {e}\n模型原始输出: {vision_response_text}") from e
-
     parsed_order_result = normalize_order_result(parsed_order_result, len(image_inputs))
 
-    # 基于解析结果加载并旋转图像转为 Base64 存于内存
     processed_b64_list = []
     if parsed_order_result.get("is_valid"):
         for page in parsed_order_result.get("sorted_pages", []):
@@ -234,7 +680,6 @@ def correct_order(state: ImagesUnderstandState) -> Dict:
             image_bytes = image_bytes_list[orig_index]
 
             with Image.open(io.BytesIO(image_bytes)) as img:
-                # 提示词为“顺时针旋转多少度使文字正向”，而 Pillow rotate 是逆时针，因此转 -rotation 度（expand=True 保证宽高互换后不裁剪）
                 rotated_img = img.rotate(-rotation, expand=True)
 
                 if rotated_img.mode in ("RGBA", "P"):
@@ -250,20 +695,48 @@ def correct_order(state: ImagesUnderstandState) -> Dict:
         "ordered_images": processed_b64_list
     }
 
+
+def extract_complete_questions(state: ImagesUnderstandState) -> Dict:
+    correct_order_result = state.get("correct_order_result", {})
+    ordered_images = state.get("ordered_images", [])
+
+    if not correct_order_result.get("is_valid"):
+        return build_empty_question_result(
+            ordered_page_count=len(ordered_images),
+            skipped_reason="correct_order_result.is_valid 为 false，跳过题目提取",
+        )
+
+    if not ordered_images:
+        raise ValueError("ordered_images is empty")
+
+    for page_index, ordered_image in enumerate(ordered_images):
+        decode_jpeg_data_uri(ordered_image, page_index)
+
+    parsed_question_result = invoke_vision_json(
+        prompt=QUESTION_EXTRACTION_PROMPT,
+        image_inputs=ordered_images,
+        index_label="page_index",
+        response_label="题目坐标结果",
+        max_tokens=4096,
+    )
+
+    return normalize_question_extraction_result(parsed_question_result, len(ordered_images))
+
 def build_agent():
     graph = StateGraph(ImagesUnderstandState)
     graph.add_node("correct_order", correct_order)
+    graph.add_node("extract_complete_questions", extract_complete_questions)
     graph.add_edge(START, "correct_order")
-    graph.add_edge("correct_order", END)
+    graph.add_edge("correct_order", "extract_complete_questions")
+    graph.add_edge("extract_complete_questions", END)
     return graph.compile()
 
 workflow_agent = build_agent()
 
 def main() -> None:
-    img_paths = [Path(path) for path in sys.argv[1:]]
-    if not img_paths:
-        print("用法: python extract_question.py <图片路径1> <图片路径2> ...")
-        sys.exit(1)
+    args = parse_args()
+    img_paths = [Path(path).expanduser() for path in args.images]
+    output_dir = Path(args.output_dir).expanduser() if args.output_dir else None
 
     try:
         user_uploaded_images = [encode_jpeg_file_to_data_uri(path) for path in img_paths]
@@ -278,6 +751,24 @@ def main() -> None:
 
     processed_b64 = final_output.get("ordered_images", [])
     print(f"\n已成功生成并在内存中存入了 {len(processed_b64)} 张经过排序和旋转修正的 Base64 格式图片。")
+
+    print("\n题目坐标提取结果：")
+    print(json.dumps(final_output.get("question_extraction_result", {}), indent=2, ensure_ascii=False))
+
+    print("\n完整题目坐标列表：")
+    print(json.dumps(final_output.get("extracted_questions", []), indent=2, ensure_ascii=False))
+
+    if output_dir is not None:
+        overlay_paths = export_question_overlays(
+            output_dir=output_dir,
+            ordered_images=final_output.get("ordered_images", []),
+            extracted_questions=final_output.get("extracted_questions", []),
+            img_paths=img_paths,
+            correct_order_result=final_output.get("correct_order_result", {}),
+        )
+        print("\n已导出题目框叠加图：")
+        for overlay_path in overlay_paths:
+            print(str(overlay_path))
 
 if __name__ == "__main__":
     main()
