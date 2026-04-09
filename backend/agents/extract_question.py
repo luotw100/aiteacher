@@ -15,6 +15,7 @@ from langgraph.graph import END, START, StateGraph
 
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage
+from rapidocr_onnxruntime import RapidOCR
 
 ENV_PATH = Path(__file__).resolve().parents[1] / ".env"
 
@@ -26,7 +27,6 @@ ALIYUN_MODEL_NAME = os.getenv("ALIYUN_MODEL_NAME")
 
 JPEG_DATA_URI_PREFIX = "data:image/jpeg;base64,"
 VALID_ROTATIONS = {0, 90, 180, 270}
-QUESTION_COORDINATE_MAX = 1000
 OVERLAY_COLOR_PALETTE = [
     (230, 57, 70),
     (29, 78, 216),
@@ -39,8 +39,9 @@ class ImagesUnderstandState(TypedDict):
     user_uploaded_images: List[str] # base64 encoded images from user upload
     correct_order_result: Dict[str, Any] # the parsed JSON result from the vision model about image validity, order and rotation
     ordered_images: List[str] # base64 encoded images after rotation correction
+    ocr_results: List[Dict[str, Any]] # OCR results for each ordered page 
     question_extraction_result: Dict[str, Any] # the parsed JSON result for retained and dropped questions
-    extracted_questions: List[Dict[str, Any]] # complete big questions with N boxes in normalized coordinates
+    extracted_questions: List[Dict[str, Any]] # complete big questions with N boxes in absolute coordinates
 
 CORRECT_ORDER_PROMPT = """
 你是一个试卷图像预处理引擎。用户上传了若干张试卷的照片.
@@ -61,64 +62,44 @@ CORRECT_ORDER_PROMPT = """
 }
 """
 
-QUESTION_EXTRACTION_PROMPT = f"""
+QUESTION_EXTRACTION_PROMPT = """
 你是一个试卷题目定位引擎。
 输入是若干张已经完成排序和方向矫正的试卷页面图片，它们已经是最终阅读顺序。每张图都会明确标出自己的 page_index。
+此外，我还附带了每张图片的 OCR (光学字符识别) 结果及其在原图上的“绝对像素坐标”。
+
 注意：由于是翻开的书本拍照，单张图片里可能会露出相邻页面的一小部分残片。你只能分析当前图片中的主体页面，不要分析边缘露出的相邻页残片。主体页面通常是画面中占比最大的那一页，并且其页码在页面底部角落能清晰看到。
 注意：页面内部的真实阅读顺序要以题号推进关系和内容续接关系为准，不要机械按全局坐标从上到下排序。
 
-你的任务是输出“完整大题”的坐标列表，规则如下：
+你的任务是利用我附带的 OCR 结果和图片视觉信息，输出“完整大题”的大包围框坐标列表。规则如下：
 1. 按大题识别，不按小题识别。比如 17.(1)(2) 只算一道题。
     - question_label 必须优先使用卷面上该大题明确可见的题号或稳定编号。
-    - 只有题干起始处清晰可见的正式大题编号，才能作为 question_label，例如“1.”、“2.”、“3.”这类编号。
-    - 如果题目本体完整，但没有明确可见的正式题号，也仍然要保留这道题；此时 question_label 不要乱猜数字，而要使用该题开头最有辨识度的前导文本作为稳定标签。
-    - 对于这种无正式题号但完整的题，优先使用题目开头紧邻题干的括号来源文字、年份地区信息、或第一段短语作为 question_label。比如题目开头是“(2024湖南娄底二模)”，那就直接把 question_label 设为“(2024湖南娄底二模)”。
-    - 不要把标题附近的小型索引、知识点编号、页码、答案页码、专题序号、题组编号、T1/T2/T3 之类的提示文字当作题号。
-    - 不要把栏目标题、专题标题、小节标题、页眉文字当作 question_label，例如“考法领航”“五年高考”“微专题”等都不是题号。
-    - 只有当一个区域既没有明确题号，也不能唯一判断为上一道已编号题目的续接，同时又无法提取出稳定的前导文本标签时，才可以丢弃；不能仅仅因为“没有数字题号”就丢弃一整道完整题。
-2. 一道大题可以对应 N 个方框：
-     - 跨两页或多页的同一道题，要输出同一个 question 对象，并给出多个 boxes。
-     - 同一页上如果题干、配图、表格等内容彼此分离，也要拆成多个 boxes。
-    - 同一道题的多个 boxes 在空间上可以不连续，甚至后续 box 的 y1 可能小于前一个 box 的 y1；这并不代表它们不是同一道题。
-    - 如果某道题在左侧栏或页面下半部开始，而其后半段续接到右侧栏或页面上半部，只要内容显然承接且下一道题号尚未开始，就必须把这些区域合并为同一道题。
-    - 典型例子：左下出现“3.”并开始题干，右上区域没有新的“4.”题号但明显是该题后半段，右下才出现“4.”，那么应输出 question_label="3" 且 boxes 为两个框，分别对应左下和右上；question_label="4" 只对应右下。
-    - 对于无题号区域，如果能根据上下文唯一判断它是上一道已编号大题的续接，可以并入上一题；如果不能唯一判断，但它本身是一道完整题，则应保留为独立 question，并使用可辨识的前导文本作为 question_label；如果既不能唯一判断归属、也没有足够稳定的前导文本标签，才不能作为独立题目保留。
-    - 同一页内不要生成两个彼此独立但 question_label 相同的 question。若两个区域都属于“第3题”，就必须合并为同一个 question 的两个 boxes；若无法合并，则说明至少有一个区域的题号判断不可靠，应将不可靠区域丢弃而不是保留成重复题号。
-    - 只有在你可以明确判断多个区域属于同一道大题时，才能把它们放进同一个 question；如果不确定，宁可拆成不同 question，也不要误合并。
-3. 只保留内容完整的大题。以下情况都算内容不全，必须整题丢弃，不能出现在 questions 里：
-     - 页面边缘裁切、遮挡、反光、暗光导致题目不完整。
-     - 只看到一道题的上半部分或下半部分。
-     - 这道题明显需要上一页或下一页才能完整，但提供的图片里缺失了对应部分。
-    - 这道题属于相邻页面残片，而不是当前主体页面。
-4. 返回的 box 坐标必须使用相对于当前页面的归一化整数坐标，范围是 0 到 {QUESTION_COORDINATE_MAX}。
-    - 这里的“当前页面坐标”严格指 page_index 对应的整张输入图片位图，也就是 ordered_images 里的完整图片边界。
-    - 归一化后的 x=0 / y=0 对应这张图片的最左上像素；x={QUESTION_COORDINATE_MAX} / y={QUESTION_COORDINATE_MAX} 对应这张图片的最右下像素。
-    - 键盘、桌面背景、纸张留白、页边阴影、相邻页残片，只要它们出现在这张输入图片里，就都属于同一个坐标系。不要只以纸张正文区域或主页面纸张边界作为坐标参考。
-     - x1, y1 是左上角
-     - x2, y2 是右下角
-     - 必须满足 0 <= x1 < x2 <= {QUESTION_COORDINATE_MAX}，0 <= y1 < y2 <= {QUESTION_COORDINATE_MAX}
-5. box 要尽量紧贴该大题在当前页面上的全部可见内容外接矩形，包括题号、题干、小题、配图、表格、作答区域等属于该大题的内容。
-    - 不要为了求稳而给出过大的宽松框。
-    - 不要把大块空白边距、相邻题目、栏目装饰、页眉页脚、无关区域一并框进去。
-    - 允许保留极少量边缘余量，但应以“贴近可见内容”为首要目标，而不是只框个大概区域。
-6. questions 只包含最终保留的大题，按真实阅读顺序输出；每个 question 内的 boxes 也按真实阅读顺序输出。不要按几何坐标大小排序。
-7. dropped_questions 里列出你识别到但因为内容不全而丢弃的大题，并写明 reason。如果无法明确题号，可以使用简短占位标签，如 "unknown_1"。
+    - 如果题目本体完整，但没有明确可见的正式题号，优先使用题目开头紧邻题干的括号来源文字、年份地区信息、或第一段短语作为 question_label。
+2. 一道大题可以对应 N 个方框：跨页或跨栏的题目应拆分多个 boxes。
+    - 如果某道大题被一分为二，请合并为同一个 question，提供两个 boxes。
+3. 只保留内容完整的大题。如果有题目明显在当前页没完全显示且无法从其它页接续，必须丢弃并在 dropped_questions 中说明。
+4. 返回的 box 必须使用原图的绝对像素坐标。
+    - 你应“严格参考属于同一题的 OCR 文本框”将它们的坐标外包围框计算出来（取最小的 x_min, y_min，最大的 x_max, y_max），并作为包围该部分内容的最终 box 返回。
+    - 这个外包围框必须覆盖这道题的所有文本内容。
+    - 输出时必须直接返回整数绝对像素坐标。
+    - x1, y1 是左上角，x2, y2 是右下角，必须满足 0 <= x1 < x2，0 <= y1 < y2。
+5. box 要尽量紧贴该大题在当前页面上的全部可见内容外接矩形。
+    - 不要为了求稳而给出过大的宽松框。不要把大块空白边距、相邻题目一并框进去。
 
-严格只输出以下 JSON 结构，不要有任何其他解释文字，你的输出第一个字符必须是 "{{"，最后一个字符必须是 "}}"：
-{{
+严格只输出以下 JSON 结构，不要有任何其他解释文字，你的输出第一个字符必须是 "{"，最后一个字符必须是 "}"：
+{
     "questions": [
-        {{
+        {
             "question_label": "17",
             "boxes": [
-                {{"page_index": 0, "x1": 120, "y1": 180, "x2": 930, "y2": 820}},
-                {{"page_index": 1, "x1": 60, "y1": 0, "x2": 940, "y2": 260}}
+                {"page_index": 0, "x1": 120, "y1": 180, "x2": 930, "y2": 820},
+                {"page_index": 1, "x1": 60, "y1": 0, "x2": 940, "y2": 260}
             ]
-        }}
+        }
     ],
     "dropped_questions": [
-        {{"question_label": "18", "reason": "第1页底部只有半道题，缺少下一页内容"}}
+        {"question_label": "18", "reason": "第1页底部只有半道题，缺少下一页内容"}
     ]
-}}
+}
 """
 
 
@@ -241,15 +222,18 @@ def invoke_vision_json(
     index_label: str,
     response_label: str,
     max_tokens: int,
+    per_image_texts: List[str] = None
 ) -> Dict[str, Any]:
     if not image_inputs:
         raise ValueError(f"{response_label}的图片输入为空")
 
     multimodal_messages = [{"type": "text", "text": prompt}]
     for idx, b64_str in enumerate(image_inputs):
-        multimodal_messages.append(
-            {"type": "text", "text": f"--- 这张图片的 {index_label} 是: {idx} ---"}
-        )
+        text_content = f"--- 这张图片的 {index_label} 是: {idx} ---\n"
+        if per_image_texts and idx < len(per_image_texts):
+            text_content += f"它的 OCR 绝对像素坐标和文本数据为（格式: [x1, y1, x2, y2], 文本内容）：\n{per_image_texts[idx]}\n"
+
+        multimodal_messages.append({"type": "text", "text": text_content})
         multimodal_messages.append({
             "type": "image_url",
             "image_url": {"url": b64_str},
@@ -339,12 +323,7 @@ def normalize_coordinate_value(
         )
 
     normalized_value = int(round(raw_value))
-    if not 0 <= normalized_value <= QUESTION_COORDINATE_MAX:
-        raise ValueError(
-            f"questions[{question_index}].boxes[{box_index}].{field_name} 必须在 0 到 {QUESTION_COORDINATE_MAX} 之间"
-        )
-
-    return normalized_value
+    return max(0, normalized_value)
 
 
 def parse_args() -> argparse.Namespace:
@@ -360,10 +339,10 @@ def parse_args() -> argparse.Namespace:
 
 
 def normalize_to_pixel_coordinates(box: Dict[str, int], width: int, height: int) -> Tuple[int, int, int, int]:
-    left = max(0, min(width - 1, math.floor(box["x1"] * (width - 1) / QUESTION_COORDINATE_MAX)))
-    top = max(0, min(height - 1, math.floor(box["y1"] * (height - 1) / QUESTION_COORDINATE_MAX)))
-    right = max(0, min(width - 1, math.ceil(box["x2"] * (width - 1) / QUESTION_COORDINATE_MAX)))
-    bottom = max(0, min(height - 1, math.ceil(box["y2"] * (height - 1) / QUESTION_COORDINATE_MAX)))
+    left = max(0, min(width - 1, box.get("x1", 0)))
+    top = max(0, min(height - 1, box.get("y1", 0)))
+    right = max(0, min(width - 1, box.get("x2", width - 1)))
+    bottom = max(0, min(height - 1, box.get("y2", height - 1)))
 
     if right <= left:
         right = min(width - 1, left + 1)
@@ -637,7 +616,7 @@ def normalize_question_extraction_result(
     return {
         "extracted_questions": extracted_questions,
         "question_extraction_result": {
-            "coordinate_system": f"normalized_0_to_{QUESTION_COORDINATE_MAX}",
+            "coordinate_system": "absolute_pixels",
             "ordered_page_count": total_pages,
             "question_count": len(extracted_questions),
             "box_count": total_boxes,
@@ -648,7 +627,7 @@ def normalize_question_extraction_result(
 
 def build_empty_question_result(ordered_page_count: int, skipped_reason: str = "") -> Dict[str, Any]:
     question_extraction_result: Dict[str, Any] = {
-        "coordinate_system": f"normalized_0_to_{QUESTION_COORDINATE_MAX}",
+        "coordinate_system": "absolute_pixels",
         "ordered_page_count": ordered_page_count,
         "question_count": 0,
         "box_count": 0,
@@ -702,10 +681,35 @@ def correct_order(state: ImagesUnderstandState) -> Dict:
         "ordered_images": processed_b64_list
     }
 
+def perform_ocr(state: ImagesUnderstandState) -> Dict:
+    ordered_images = state.get("ordered_images", [])
+    if not ordered_images:
+        return {"ocr_results": []}
+
+    ocr = RapidOCR() 
+    
+    ocr_results = []
+    print(f"\n[OCR] 正在对 {len(ordered_images)} 张图片进行 OCR 文字提取...")
+    for idx, ordered_image in enumerate(ordered_images):
+        img_bytes = decode_jpeg_data_uri(ordered_image, idx)
+        
+        result, elapse = ocr(img_bytes)
+        page_texts = []
+        if result:
+            for box, text, score in result:
+                xs = [p[0] for p in box]
+                ys = [p[1] for p in box]
+                x1, y1, x2, y2 = min(xs), min(ys), max(xs), max(ys)
+                page_texts.append(f"[{int(x1)}, {int(y1)}, {int(x2)}, {int(y2)}], {text}")
+                
+        ocr_results.append({"page_index": idx, "ocr_lines": page_texts})
+
+    return {"ocr_results": ocr_results}
 
 def extract_complete_questions(state: ImagesUnderstandState) -> Dict:
     correct_order_result = state.get("correct_order_result", {})
     ordered_images = state.get("ordered_images", [])
+    ocr_results = state.get("ocr_results", [])
 
     if not correct_order_result.get("is_valid"):
         return build_empty_question_result(
@@ -719,12 +723,18 @@ def extract_complete_questions(state: ImagesUnderstandState) -> Dict:
     for page_index, ordered_image in enumerate(ordered_images):
         decode_jpeg_data_uri(ordered_image, page_index)
 
+    per_image_texts = []
+    for ocr_res in ocr_results:
+        # 裁剪一定长度，避免极端情况超过长上下文
+        per_image_texts.append("\n".join(ocr_res.get("ocr_lines", []))[:15000])
+
     parsed_question_result = invoke_vision_json(
         prompt=QUESTION_EXTRACTION_PROMPT,
         image_inputs=ordered_images,
         index_label="page_index",
         response_label="题目坐标结果",
         max_tokens=4096,
+        per_image_texts=per_image_texts
     )
 
     return normalize_question_extraction_result(parsed_question_result, len(ordered_images))
@@ -732,9 +742,12 @@ def extract_complete_questions(state: ImagesUnderstandState) -> Dict:
 def build_agent():
     graph = StateGraph(ImagesUnderstandState)
     graph.add_node("correct_order", correct_order)
+    graph.add_node("perform_ocr", perform_ocr)
     graph.add_node("extract_complete_questions", extract_complete_questions)
+    
     graph.add_edge(START, "correct_order")
-    graph.add_edge("correct_order", "extract_complete_questions")
+    graph.add_edge("correct_order", "perform_ocr")
+    graph.add_edge("perform_ocr", "extract_complete_questions")
     graph.add_edge("extract_complete_questions", END)
     return graph.compile()
 
