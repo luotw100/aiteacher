@@ -5,6 +5,7 @@ import json
 import base64
 import io
 import binascii
+import math
 from PIL import Image, ImageDraw, ImageFont
 from pathlib import Path
 from typing import Any, TypedDict, Dict, List, Tuple
@@ -90,10 +91,16 @@ QUESTION_EXTRACTION_PROMPT = f"""
      - 这道题明显需要上一页或下一页才能完整，但提供的图片里缺失了对应部分。
     - 这道题属于相邻页面残片，而不是当前主体页面。
 4. 返回的 box 坐标必须使用相对于当前页面的归一化整数坐标，范围是 0 到 {QUESTION_COORDINATE_MAX}。
+    - 这里的“当前页面坐标”严格指 page_index 对应的整张输入图片位图，也就是 ordered_images 里的完整图片边界。
+    - 归一化后的 x=0 / y=0 对应这张图片的最左上像素；x={QUESTION_COORDINATE_MAX} / y={QUESTION_COORDINATE_MAX} 对应这张图片的最右下像素。
+    - 键盘、桌面背景、纸张留白、页边阴影、相邻页残片，只要它们出现在这张输入图片里，就都属于同一个坐标系。不要只以纸张正文区域或主页面纸张边界作为坐标参考。
      - x1, y1 是左上角
      - x2, y2 是右下角
      - 必须满足 0 <= x1 < x2 <= {QUESTION_COORDINATE_MAX}，0 <= y1 < y2 <= {QUESTION_COORDINATE_MAX}
-5. box 要尽量完整覆盖该大题在当前页面上的全部可见内容，包括题号、题干、小题、配图、表格、作答区域等属于该大题的内容。
+5. box 要尽量紧贴该大题在当前页面上的全部可见内容外接矩形，包括题号、题干、小题、配图、表格、作答区域等属于该大题的内容。
+    - 不要为了求稳而给出过大的宽松框。
+    - 不要把大块空白边距、相邻题目、栏目装饰、页眉页脚、无关区域一并框进去。
+    - 允许保留极少量边缘余量，但应以“贴近可见内容”为首要目标，而不是只框个大概区域。
 6. questions 只包含最终保留的大题，按真实阅读顺序输出；每个 question 内的 boxes 也按真实阅读顺序输出。不要按几何坐标大小排序。
 7. dropped_questions 里列出你识别到但因为内容不全而丢弃的大题，并写明 reason。如果无法明确题号，可以使用简短占位标签，如 "unknown_1"。
 
@@ -353,10 +360,10 @@ def parse_args() -> argparse.Namespace:
 
 
 def normalize_to_pixel_coordinates(box: Dict[str, int], width: int, height: int) -> Tuple[int, int, int, int]:
-    left = max(0, min(width - 1, int(box["x1"] * width / QUESTION_COORDINATE_MAX)))
-    top = max(0, min(height - 1, int(box["y1"] * height / QUESTION_COORDINATE_MAX)))
-    right = max(0, min(width - 1, int(box["x2"] * width / QUESTION_COORDINATE_MAX)))
-    bottom = max(0, min(height - 1, int(box["y2"] * height / QUESTION_COORDINATE_MAX)))
+    left = max(0, min(width - 1, math.floor(box["x1"] * (width - 1) / QUESTION_COORDINATE_MAX)))
+    top = max(0, min(height - 1, math.floor(box["y1"] * (height - 1) / QUESTION_COORDINATE_MAX)))
+    right = max(0, min(width - 1, math.ceil(box["x2"] * (width - 1) / QUESTION_COORDINATE_MAX)))
+    bottom = max(0, min(height - 1, math.ceil(box["y2"] * (height - 1) / QUESTION_COORDINATE_MAX)))
 
     if right <= left:
         right = min(width - 1, left + 1)
