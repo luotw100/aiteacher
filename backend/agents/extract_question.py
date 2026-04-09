@@ -469,6 +469,65 @@ def export_question_overlays(
     return saved_files
 
 
+
+def export_ocr_overlays(
+    output_dir: Path,
+    ordered_images: List[str],
+    ocr_results: List[Dict[str, Any]],
+    img_paths: List[Path],
+    correct_order_result: Dict[str, Any],
+) -> List[Path]:
+    import re
+    output_dir.mkdir(parents=True, exist_ok=True)
+    ordered_page_images = [
+        decode_jpeg_data_uri_to_image(image_data_uri, page_index)
+        for page_index, image_data_uri in enumerate(ordered_images)
+    ]
+    page_overlays = [Image.new("RGBA", image.size, (0, 0, 0, 0)) for image in ordered_page_images]
+    border_drawers = [ImageDraw.Draw(overlay, "RGBA") for overlay in page_overlays]
+
+    base_width = ordered_page_images[0].width if ordered_page_images else 0
+    font = load_overlay_font(max(14, base_width // 60 if base_width else 14))
+    border_width = max(2, base_width // 400 if base_width else 2)
+
+    for ocr_res in ocr_results:
+        page_index = ocr_res.get("page_index", 0)
+        drawer = border_drawers[page_index]
+        image = ordered_page_images[page_index]
+        
+        for line in ocr_res.get("ocr_lines", []):
+            match = re.match(r"\[(\d+),\s*(\d+),\s*(\d+),\s*(\d+)\],(.*)", line)
+            if match:
+                x1, y1, x2, y2 = map(int, match.groups()[:4])
+                text = match.group(5).strip()
+                
+                drawer.rectangle(
+                    [(x1, y1), (x2, y2)],
+                    outline=(0, 255, 0, 200),
+                    width=border_width,
+                )
+                
+                # Draw text loosely
+                text_bbox = drawer.textbbox((0, 0), text, font=font)
+                text_w, text_h = text_bbox[2] - text_bbox[0], text_bbox[3] - text_bbox[1]
+                drawer.rectangle(
+                    [(x1, max(0, y1 - text_h - 4)), (x1 + text_w, max(0, y1))],
+                    fill=(0, 255, 0, 180)
+                )
+                drawer.text((x1, max(0, y1 - text_h - 4)), text, font=font, fill=(0, 0, 0, 255))
+
+    saved_files = []
+    for page_index, image in enumerate(ordered_page_images):
+        composited_image = Image.alpha_composite(image, page_overlays[page_index]).convert("RGB")
+        original_name = build_overlay_output_name(page_index, img_paths, correct_order_result)
+        ocr_name = original_name.replace("_overlay.jpg", "_OCR.jpg")
+        output_path = output_dir / ocr_name
+        composited_image.save(output_path, format="JPEG", quality=95)
+        saved_files.append(output_path)
+
+    return saved_files
+
+
 def normalize_question_box(
     raw_box: Any,
     total_pages: int,
@@ -779,6 +838,17 @@ def main() -> None:
     print(json.dumps(final_output.get("extracted_questions", []), indent=2, ensure_ascii=False))
 
     if output_dir is not None:
+        ocr_paths = export_ocr_overlays(
+            output_dir=output_dir,
+            ordered_images=final_output.get("ordered_images", []),
+            ocr_results=final_output.get("ocr_results", []),
+            img_paths=img_paths,
+            correct_order_result=final_output.get("correct_order_result", {}),
+        )
+        print("\n已导出OCR探测叠加图：")
+        for p in ocr_paths:
+            print(str(p))
+            
         overlay_paths = export_question_overlays(
             output_dir=output_dir,
             ordered_images=final_output.get("ordered_images", []),
